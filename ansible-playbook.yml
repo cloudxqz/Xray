@@ -1,0 +1,194 @@
+---
+- name: Deploy Xray VPN with generated configs
+  hosts: vpn_servers
+  become: yes
+  vars:
+    xray_version: v1.8.1
+    xray_url: "https://github.com/XTLS/Xray-core/releases/download/{{ xray_version }}/Xray-linux-64.zip"
+    config_path: /opt/xray/config.json
+    service_path: /usr/lib/systemd/system/xray.service
+    listen_ip: "YourIP"
+    dest_host: "yahoo.com:443"
+    dest_sni: "yahoo.com"
+
+  tasks:
+    - name: Install dependencies
+      apt:
+        name:
+          - unzip
+          - iptables
+          - openssl
+          - uuid-runtime
+        state: present
+        update_cache: yes
+
+    - name: Download Xray archive
+      get_url:
+        url: "{{ xray_url }}"
+        dest: /tmp/Xray-linux-64.zip
+
+    - name: Create Xray directory
+      file:
+        path: /opt/xray
+        state: directory
+        mode: '0755'
+
+    - name: Unzip Xray to /opt/xray
+      unarchive:
+        src: /tmp/Xray-linux-64.zip
+        dest: /opt/xray
+        remote_src: yes
+
+    - name: Ensure xray binary is executable
+      file:
+        path: /opt/xray/xray
+        mode: '0755'
+        state: file
+
+    - name: Generate UUID
+      command: "uuidgen"
+      register: uuid_result
+      changed_when: false
+
+    - name: Generate x25519 keypair
+      command: "/opt/xray/xray x25519"
+      register: keypair
+      changed_when: false
+
+    - set_fact:
+        private_key: "{{ keypair.stdout_lines[0].split(': ')[1] }}"
+        public_key: "{{ keypair.stdout_lines[1].split(': ')[1] }}"
+
+    - name: Generate shortId
+      command: "openssl rand -hex 8"
+      register: shortid_result
+      changed_when: false
+
+    - set_fact:
+        short_id: "{{ shortid_result.stdout }}"
+
+    - name: Create config.json from template
+      copy:
+        dest: "{{ config_path }}"
+        mode: '0644'
+        content: |
+          {
+            "log": {
+              "loglevel": "info"
+            },
+            "routing": {
+              "rules": [],
+              "domainStrategy": "AsIs"
+            },
+            "inbounds": [
+              {
+                "listen": "{{ listen_ip }}",
+                "port": 443,
+                "protocol": "vless",
+                "tag": "vless_tls",
+                "settings": {
+                  "clients": [
+                    {
+                      "id": "{{ uuid_result.stdout }}",
+                      "email": "qwerty",
+                      "flow": "xtls-rprx-vision"
+                    }
+                  ],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                      "show": false,
+                      "dest": "{{ dest_host }}",
+                      "xver": 0,
+                      "serverNames": [
+                          "{{ dest_sni }}"
+                      ],
+                      "privateKey": "{{ private_key }}",
+                      "minClientVer": "",
+                      "maxClientVer": "",
+                      "maxTimeDiff": 0,
+                      "shortIds": [
+                          "{{ short_id }}"
+                      ]
+                  }
+                },
+                "sniffing": {
+                  "enabled": true,
+                  "destOverride": [
+                    "http",
+                    "tls"
+                  ]
+                }
+              }
+            ],
+            "outbounds": [
+              {
+                "protocol": "freedom",
+                "tag": "direct"
+              },
+              {
+                "protocol": "blackhole",
+                "tag": "block"
+              }
+            ]
+          }
+
+    - name: Create systemd service file
+      copy:
+        dest: "{{ service_path }}"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Xray Service
+          Documentation=https://github.com/xtls
+          After=network.target nss-lookup.target
+
+          [Service]
+          User=nobody
+          CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+          AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+          NoNewPrivileges=true
+          ExecStart=/opt/xray/xray run -config /opt/xray/config.json
+          Restart=on-failure
+          RestartPreventExitStatus=23
+          LimitNPROC=10000
+          LimitNOFILE=1000000
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      command: systemctl daemon-reload
+
+    - name: Enable Xray service
+      systemd:
+        name: xray
+        enabled: yes
+        state: started
+
+    - name: Set IPv4 forwarding ON
+      lineinfile:
+        path: /etc/sysctl.conf
+        regexp: '^net.ipv4.ip_forward='
+        line: 'net.ipv4.ip_forward=1'
+
+    - name: Apply sysctl parameters
+      command: sysctl -p
+
+    - name: Set iptables for UDP traffic on port 443
+      ansible.builtin.iptables:
+        table: nat
+        chain: PREROUTING
+        protocol: udp
+        in_interface: ens3
+        destination_port: '443'
+        jump: DNAT
+        to_destination: "{{ listen_ip }}"
+
+    - name: Restart Xray
+      systemd:
+        name: xray
+        state: restarted
