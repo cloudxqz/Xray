@@ -1,0 +1,117 @@
+---
+- name: Add new client to Xray config with backup, save key and QR
+  hosts: all
+  become: yes
+  vars:
+    config_path: /opt/xray/config.json
+    backup_path: /opt/xray/config.json.bak
+    client_key_path: /opt/xray/client_vless.txt
+    client_qr_path: /opt/xray/client_qr.png
+    listen_ip: "yourIP"      # Укажите IP вашего сервера
+    port: 443
+    dest_host: "yahoo.com:443"
+    dest_sni: "yahoo.com"
+    fp: "chrome"
+    flow: "xtls-rprx-vision"
+    service_name: xray
+
+  tasks:
+    - name: Ensure dependencies (jq, qrencode)
+      apt:
+        name:
+          - jq
+          - qrencode
+        state: present
+        update_cache: yes
+
+    - name: Backup current config.json
+      copy:
+        src: "{{ config_path }}"
+        dest: "{{ backup_path }}"
+        remote_src: yes
+        backup: yes
+
+    - name: Load existing Xray config
+      slurp:
+        src: "{{ config_path }}"
+      register: config_file
+
+    - name: Decode JSON config
+      set_fact:
+        xray_config: "{{ config_file.content | b64decode | from_json }}"
+
+    - name: Generate new UUID for client
+      command: uuidgen
+      register: new_uuid
+      changed_when: false
+
+    - name: Generate new shortId
+      command: openssl rand -hex 8
+      register: new_shortid
+      changed_when: false
+
+    - name: Add new client to clients list
+      set_fact:
+        new_clients: "{{ xray_config.inbounds[0].settings.clients + [{'id': new_uuid.stdout, 'email': 'newuser', 'flow': flow}] }}"
+
+    - name: Add new shortId to shortIds list
+      set_fact:
+        new_shortids: "{{ xray_config.inbounds[0].streamSettings.realitySettings.shortIds + [new_shortid.stdout] }}"
+
+    - name: Update config with new client and shortId
+      set_fact:
+        updated_config: >-
+          {{
+            xray_config | combine({
+              'inbounds': [
+                xray_config.inbounds[0] | combine({
+                  'settings': xray_config.inbounds[0].settings | combine({
+                    'clients': new_clients
+                  }),
+                  'streamSettings': xray_config.inbounds[0].streamSettings | combine({
+                    'realitySettings': xray_config.inbounds[0].streamSettings.realitySettings | combine({
+                      'shortIds': new_shortids
+                    })
+                  })
+                })
+              ]
+            }, recursive=True)
+          }}
+
+    - name: Save updated config.json
+      copy:
+        dest: "{{ config_path }}"
+        content: "{{ updated_config | to_nice_json }}"
+        mode: '0644'
+
+    - name: Extract privateKey and publicKey from updated config
+      set_fact:
+        private_key: "{{ updated_config.inbounds[0].streamSettings.realitySettings.privateKey }}"
+        public_key: "{{ updated_config.inbounds[0].streamSettings.realitySettings.publicKey }}"
+
+    - name: Build new VLESS Reality connection string
+      set_fact:
+        new_vless_key: >-
+          vless://{{ new_uuid.stdout }}@{{ listen_ip }}:{{ port }}?encryption=none&type=tcp&security=reality&pbk={{ public_key }}&fp={{ fp }}&sni={{ dest_sni }}&sid={{ new_shortid.stdout }}&flow={{ flow }}
+
+    - name: Save new VLESS connection string to text file (overwrite)
+      copy:
+        content: "{{ new_vless_key }}"
+        dest: "{{ client_key_path }}"
+        mode: '0644'
+
+    - name: Generate QR code image from VLESS connection string (overwrite)
+      command: qrencode -o {{ client_qr_path }} "{{ new_vless_key }}"
+
+    - name: Restart Xray service to apply new config
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+
+    - name: Display new VLESS connection string
+      debug:
+        msg: "New VLESS connection key: {{ new_vless_key }}"
+
+    - name: Display QR code file path
+      debug:
+        msg: "QR code saved to: {{ client_qr_path }}"
