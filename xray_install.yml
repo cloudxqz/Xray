@@ -94,7 +94,7 @@
                   "clients": [
                     {
                       "id": "{{ uuid_result.stdout }}",
-                      "email": "german",
+                      "email": "qwerty",
                       "flow": "{{ flow }}"
                     }
                   ],
