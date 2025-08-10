@@ -1,7 +1,7 @@
 # Xray
 
 ## Install Xray
-apt install ansible
+apt install ansible \n
 ansible-playbook -i 127.0.0.1 xray_install.yml
 
 ## Add new client (qr + text key)
