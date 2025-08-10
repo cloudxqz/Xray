@@ -1,18 +1,22 @@
 ---
-- name: Deploy Xray VPN with generated configs
-  hosts: vpn_servers
+- name: Full Xray VPN deployment with Reality and saved publicKey
+  hosts: all
   become: yes
   vars:
     xray_version: v1.8.1
     xray_url: "https://github.com/XTLS/Xray-core/releases/download/{{ xray_version }}/Xray-linux-64.zip"
     config_path: /opt/xray/config.json
     service_path: /usr/lib/systemd/system/xray.service
-    listen_ip: "YourIP"
+
+    listen_ip: "yourip"         # Замените на IP вашего сервера
+    port: 443
     dest_host: "yahoo.com:443"
     dest_sni: "yahoo.com"
+    fp: "chrome"
+    flow: "xtls-rprx-vision"
 
   tasks:
-    - name: Install dependencies
+    - name: Install required packages
       apt:
         name:
           - unzip
@@ -22,52 +26,52 @@
         state: present
         update_cache: yes
 
-    - name: Download Xray archive
+    - name: Download Xray binary archive
       get_url:
         url: "{{ xray_url }}"
         dest: /tmp/Xray-linux-64.zip
 
-    - name: Create Xray directory
+    - name: Create Xray installation directory
       file:
         path: /opt/xray
         state: directory
         mode: '0755'
 
-    - name: Unzip Xray to /opt/xray
+    - name: Unzip Xray binary
       unarchive:
         src: /tmp/Xray-linux-64.zip
         dest: /opt/xray
         remote_src: yes
 
-    - name: Ensure xray binary is executable
+    - name: Set executable permission on xray binary
       file:
         path: /opt/xray/xray
         mode: '0755'
         state: file
 
-    - name: Generate UUID
+    - name: Generate UUID for client
       command: "uuidgen"
       register: uuid_result
       changed_when: false
 
     - name: Generate x25519 keypair
       command: "/opt/xray/xray x25519"
-      register: keypair
+      register: keypair_result
       changed_when: false
 
     - set_fact:
-        private_key: "{{ keypair.stdout_lines[0].split(': ')[1] }}"
-        public_key: "{{ keypair.stdout_lines[1].split(': ')[1] }}"
+        private_key: "{{ keypair_result.stdout_lines[0].split(': ')[1] }}"
+        public_key: "{{ keypair_result.stdout_lines[1].split(': ')[1] }}"
 
-    - name: Generate shortId
+    - name: Generate single shortId
       command: "openssl rand -hex 8"
-      register: shortid_result
+      register: shortid
       changed_when: false
 
     - set_fact:
-        short_id: "{{ shortid_result.stdout }}"
+        short_id: "{{ shortid.stdout }}"
 
-    - name: Create config.json from template
+    - name: Create Xray config.json with privateKey and publicKey stored
       copy:
         dest: "{{ config_path }}"
         mode: '0644'
@@ -83,15 +87,15 @@
             "inbounds": [
               {
                 "listen": "{{ listen_ip }}",
-                "port": 443,
+                "port": {{ port }},
                 "protocol": "vless",
                 "tag": "vless_tls",
                 "settings": {
                   "clients": [
                     {
                       "id": "{{ uuid_result.stdout }}",
-                      "email": "qwerty",
-                      "flow": "xtls-rprx-vision"
+                      "email": "german",
+                      "flow": "{{ flow }}"
                     }
                   ],
                   "decryption": "none"
@@ -100,19 +104,20 @@
                   "network": "tcp",
                   "security": "reality",
                   "realitySettings": {
-                      "show": false,
-                      "dest": "{{ dest_host }}",
-                      "xver": 0,
-                      "serverNames": [
-                          "{{ dest_sni }}"
-                      ],
-                      "privateKey": "{{ private_key }}",
-                      "minClientVer": "",
-                      "maxClientVer": "",
-                      "maxTimeDiff": 0,
-                      "shortIds": [
-                          "{{ short_id }}"
-                      ]
+                    "show": false,
+                    "dest": "{{ dest_host }}",
+                    "xver": 0,
+                    "serverNames": [
+                      "{{ dest_sni }}"
+                    ],
+                    "privateKey": "{{ private_key }}",
+                    "publicKey": "{{ public_key }}",
+                    "minClientVer": "",
+                    "maxClientVer": "",
+                    "maxTimeDiff": 0,
+                    "shortIds": [
+                      "{{ short_id }}"
+                    ]
                   }
                 },
                 "sniffing": {
@@ -136,7 +141,7 @@
             ]
           }
 
-    - name: Create systemd service file
+    - name: Create systemd service file for Xray
       copy:
         dest: "{{ service_path }}"
         mode: '0644'
@@ -160,35 +165,40 @@
           [Install]
           WantedBy=multi-user.target
 
-    - name: Reload systemd
+    - name: Reload systemd daemon to apply service file changes
       command: systemctl daemon-reload
 
-    - name: Enable Xray service
+    - name: Enable and start Xray service
       systemd:
         name: xray
         enabled: yes
         state: started
 
-    - name: Set IPv4 forwarding ON
+    - name: Enable IPv4 forwarding in sysctl.conf
       lineinfile:
         path: /etc/sysctl.conf
         regexp: '^net.ipv4.ip_forward='
         line: 'net.ipv4.ip_forward=1'
 
-    - name: Apply sysctl parameters
+    - name: Apply sysctl settings
       command: sysctl -p
 
-    - name: Set iptables for UDP traffic on port 443
+    - name: Add iptables rule for UDP port 443 DNAT on interface ens3
       ansible.builtin.iptables:
         table: nat
         chain: PREROUTING
         protocol: udp
-        in_interface: ens3
-        destination_port: '443'
+        in_interface: your interface name
+        destination_port: "{{ port }}"
         jump: DNAT
         to_destination: "{{ listen_ip }}"
 
-    - name: Restart Xray
+    - name: Restart Xray service after configuration changes
       systemd:
         name: xray
         state: restarted
+
+    - name: Display client VLESS Reality connection URI
+      debug:
+        msg: >
+          vless://{{ uuid_result.stdout }}@{{ listen_ip }}:{{ port }}?encryption=none&type=tcp&security=reality&pbk={{ public_key }}&fp={{ fp }}&sni={{ dest_sni }}&sid={{ short_id }}&flow={{ flow }}
